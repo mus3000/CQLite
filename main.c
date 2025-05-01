@@ -16,6 +16,12 @@
 #define TABLE_MAX_PAGES 100
 
 
+
+typedef enum {
+    NODE_INTERNAL,
+    NOTE_LEAF
+} NodeType;
+
 typedef struct {
     char* buffer;
     size_t buffer_length;
@@ -77,6 +83,12 @@ typedef struct {
     Pager* pager;
 } Table;
 
+typedef struct {
+    Table* table;
+    uint32_t row_num;
+    bool end_of_table;
+} Cursor;
+
 const uint32_t ID_SIZE = size_of_attribute(Row, id);
 const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
 const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);
@@ -90,10 +102,45 @@ const uint32_t PAGE_SIZE = 4096;
 const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
 const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
+/*
+Common Node Header Layout
+*/
+const uint32_t NODE_TYPE_SIZE = sizeof(uint8_t); // 8位元1字節
+const uint32_t NODE_TYPE_OFFSET = 0;
+const uint32_t IS_ROOT_SIZE = sizeof(uint8_t);
+const uint32_t IS_ROOT_OFFSET = NODE_TYPE_SIZE;
+const uint32_t PARENT_POINTER_SIZE = sizeof(uint32_t); // 32位元4字節
+const uint32_t PARENT_POINTER_OFFSET = IS_ROOT_OFFSET + IS_ROOT_SIZE;
+const uint8_t COMMON_NODE_HEADER_SIZE =
+    NODE_TYPE_SIZE + IS_ROOT_SIZE + PARENT_POINTER_SIZE;
+
+/*
+Leaf Node Hedaer Layout
+*/
+const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE =
+    COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+
+
+/*
+Leaf Node Body Layout
+*/
+const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_KEY_OFFSET = 0;
+const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
+const uint32_t LEAF_NODE_VALUE_OFFSET =
+    LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
+const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
+const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
+const uint32_t LEAF_NODE_MAX_CELLS =
+    LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
 
 //預先宣告函數
 void serialize_row(Row* source, void* destination);
-void* row_slot(Table* table, uint32_t row_num);
+// void* row_slot(Table* table, uint32_t row_num);
+void* cursor_value(Cursor* cursor);
+void cursor_advance(Cursor* cursor);
 void deserialize_row(void* source, Row* destination);
 Pager* pager_open(const char* filename);
 void* get_page(Pager* pager, uint32_t page_num);
@@ -102,6 +149,28 @@ void pager_flush(Pager* pager, uint32_t page_num, uint32_t size);
 void print_row(Row* row) {
     printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
+
+uint32_t* leaf_node_num_cells(void* node) {
+    return node + LEAF_NODE_NUM_CELLS_OFFSET;
+}
+
+void* leaf_node_cell(void* node, uint32_t cell_num) {
+    return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+}
+
+uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
+    return leaf_node_cell(node, cell_num);
+}
+
+void* leaf_node_value(void* node, uint32_t cell_num) {
+    return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+}
+
+void initialize_leaf_node(void* node) {
+    *leaf_node_num_cells(node) = 0;
+}
+
+
 
 //init table
 Table* db_open(const char* filename) {
@@ -154,6 +223,23 @@ void db_close(Table* table) {
     free(pager);
     free(table);
 
+}
+
+
+Cursor* table_start(Table* table) {
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->row_num = 0;
+    cursor->end_of_table = (table->num_rows == 0);
+    return cursor;
+}
+
+Cursor* table_end(Table* table) {
+    Cursor* cursor = malloc(sizeof(Cursor));
+    cursor->table = table;
+    cursor->row_num = table->num_rows;
+    cursor->end_of_table = true;
+    return cursor;
 }
 
 void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
@@ -269,19 +355,26 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
     }
 
     Row* row_to_insert = &(statement->row_to_insert);
-    serialize_row(row_to_insert, row_slot(table, table->num_rows));
+    Cursor* cursor = table_end(table);
+    
+    serialize_row(row_to_insert, cursor_value(cursor));
     table->num_rows += 1;
 
+    free(cursor);
     return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement* statement, Table* table) {
+    Cursor* cursor = table_start(table);
+
     Row row;
-    for (uint32_t i = 0; i < table->num_rows; i++) {
-        deserialize_row(row_slot(table, i), &row);
+    while(!cursor->end_of_table) {
+        deserialize_row(cursor_value(cursor), &row);
         print_row(&row);
+        cursor_advance(cursor);
     }
 
+    free(cursor);
     return EXECUTE_SUCCESS;
 }
 
@@ -334,13 +427,23 @@ void deserialize_row(void* source, Row* destination)
     memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-void* row_slot(Table* table, uint32_t row_num) {
+void* cursor_value(Cursor* cursor) {
+    uint32_t row_num = cursor->row_num;
     uint32_t page_num = row_num / ROWS_PER_PAGE;
-    void* page = get_page(table->pager, page_num);
+    void* page = get_page(cursor->table->pager, page_num);
     uint32_t row_offset = row_num % ROWS_PER_PAGE;
     uint32_t byte_offset = row_offset * ROW_SIZE;
     return page + byte_offset;
 }
+
+void cursor_advance(Cursor* cursor) {
+    cursor->row_num += 1;
+    if (cursor->row_num >= cursor->table->num_rows) {
+        cursor->end_of_table = true;
+    }
+}
+
+
 
 //惰性加载（Lazy Loading） 策略，只有在实际访问某页面时才将其从磁盘加载到内存。
 void* get_page(Pager* pager, uint32_t page_num) {
